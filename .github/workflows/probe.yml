@@ -1,0 +1,107 @@
+name: Reporting boundary probe
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  event:
+    name: push-payload
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Record bounded push fields (no secrets or full payload)
+        shell: python
+        run: |
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          fields = {key: event.get(key) for key in ('before', 'after', 'created', 'deleted', 'forced', 'ref')}
+          fields.update(event_name=os.environ['GITHUB_EVENT_NAME'], github_sha=os.environ['GITHUB_SHA'], utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
+          print('PUSH_PROBE ' + json.dumps(fields, sort_keys=True))
+          Path(os.environ['GITHUB_STEP_SUMMARY']).write_text('## Push payload\n\n```json\n' + json.dumps(fields, indent=2, sort_keys=True) + '\n```\n')
+
+  annotations:
+    name: annotations-${{ matrix.severity }}-${{ matrix.count }}
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        severity: [error, warning, notice]
+        count: [10, 11]
+    steps:
+      - name: Emit requested commands; process exits zero even for error annotations
+        env:
+          PROBE_SEVERITY: ${{ matrix.severity }}
+          PROBE_COUNT: ${{ matrix.count }}
+        shell: python
+        run: |
+          import datetime
+          import json
+          import os
+          severity = os.environ['PROBE_SEVERITY']
+          count = int(os.environ['PROBE_COUNT'])
+          print('ANNOTATION_PROBE ' + json.dumps(dict(severity=severity, requested=count, expected_process_exit=0, utc=datetime.datetime.now(datetime.timezone.utc).isoformat()), sort_keys=True))
+          for index in range(1, count + 1):
+              print(f'::{severity} file=probe.txt,line=1,title=boundary-{severity}-{count}::{severity}-{count}-{index:02d}')
+      - name: Verify following step runs without continue-on-error
+        run: python -c "print('AFTER_ANNOTATIONS_EXECUTED')"
+
+  flood:
+    name: high-first-flood
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Emit one HIGH first then 60 WARN and 60 INFO; process exits zero
+        shell: python
+        run: |
+          print('FLOOD_PROBE requested_error=1 requested_warning=60 requested_notice=60 expected_process_exit=0')
+          print('::error file=probe.txt,line=1,title=HIGH-first::HIGH-FIRST-001')
+          for severity in ('warning', 'notice'):
+              for index in range(1, 61):
+                  print(f'::{severity} file=probe.txt,line=1,title=flood-{severity}::FLOOD-{severity}-{index:03d}')
+      - name: Verify following step runs without continue-on-error
+        run: python -c "print('AFTER_FLOOD_EXECUTED')"
+
+  summaries:
+    name: summary-${{ matrix.bytes }}
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        bytes: [1048576, 1048577]
+    steps:
+      - name: Write exact byte count; cap+1 deliberately expects runner upload rejection
+        env:
+          PROBE_BYTES: ${{ matrix.bytes }}
+        shell: python
+        run: |
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          size = int(os.environ['PROBE_BYTES'])
+          prefix = f'## Exact-byte summary probe {size}\n\nSUMMARY-BEGIN-{size}\n\n```text\n'.encode('ascii')
+          suffix = f'\n```\n\nSUMMARY-END-{size}\n'.encode('ascii')
+          padding_size = size - len(prefix) - len(suffix)
+          block = b'0123456789abcdef' * 4 + b'\n'
+          content = prefix + (block * (padding_size // len(block) + 1))[:padding_size] + suffix
+          assert len(content) == size
+          path = Path(os.environ['GITHUB_STEP_SUMMARY'])
+          path.write_bytes(content)
+          assert path.stat().st_size == size
+          print('SUMMARY_PROBE ' + json.dumps(dict(bytes=size, sha256=hashlib.sha256(content).hexdigest(), utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), expected_upload='accepted' if size == 1048576 else 'rejected', expected_process_exit=0), sort_keys=True))
+      - name: Verify subsequent step executes; summary upload errors should not fail job
+        run: python -c "print('AFTER_SUMMARY_EXECUTED')"
